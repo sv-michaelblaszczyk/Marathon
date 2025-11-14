@@ -1,0 +1,224 @@
+name: Security Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+name: Static Scans
+
+on:
+  #push: # not on push for the training (just manual)
+  workflow_dispatch: # to allow running manually
+
+permissions:
+  contents: read
+
+
+jobs:
+
+  sast-scans:
+    name: SAST Scans
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: 11
+          distribution: 'temurin'
+
+      - name: Setup Maven Dependency Cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Build with Maven
+        run: mvn clean install
+ 
+
+
+jobs:
+  spotbugs:
+    name: SpotBugs Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 8
+      uses: actions/setup-java@v4
+      with:
+        java-version: '8'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Set up Node.js 14
+      uses: actions/setup-node@v4
+      with:
+        node-version: '14'
+        cache: 'npm'
+        cache-dependency-path: 'client/angular/package-lock.json'
+
+    - name: Install frontend dependencies
+      run: cd client/angular && npm install
+
+    - name: Build frontend
+      run: cd client/angular && npm run build
+
+    - name: Run SpotBugs
+      run: mvn clean compile spotbugs:spotbugs
+
+    - name: Upload SpotBugs results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: spotbugs-results
+        path: target/spotbugsXml.xml
+        retention-days: 30
+
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    - name: Upload Trivy results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        category: 'trivy'
+
+  dependency-check:
+    name: OWASP Dependency-Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Run Dependency-Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        path: '.'
+        format: 'SARIF'
+        args: >
+          --enable-retired
+          --suppression integration/false-positives/dependency-check-suppressions.xml
+
+    - name: Upload Dependency-Check results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'dependency-check-report.sarif'
+        category: 'dependency-check'
+
+  npm-audit:
+    name: NPM Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Node.js 14
+      uses: actions/setup-node@v4
+      with:
+        node-version: '14'
+        cache: 'npm'
+        cache-dependency-path: 'client/angular/package-lock.json'
+
+    - name: Install frontend dependencies
+      run: cd client/angular && npm install
+
+    - name: Run npm audit
+      run: cd client/angular && npm audit --json > npm-audit-report.json || true
+
+    - name: Upload npm audit results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: npm-audit-results
+        path: client/angular/npm-audit-report.json
+        retention-days: 30
+
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Run Semgrep
+      uses: returntocorp/semgrep-action@v1
+      with:
+        generateSarif: true
+        config: >-
+          p/security-audit
+          p/owasp-top-ten
+          p/cwe-top-25
+
+    - name: Upload Semgrep results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'semgrep.sarif'
+        category: 'semgrep'
+
+  security-report:
+    name: Security Report Summary
+    runs-on: ubuntu-latest
+    needs: [spotbugs, trivy-fs, dependency-check, npm-audit, semgrep]
+    if: always()
+
+    steps:
+    - name: Download all scan results
+      uses: actions/download-artifact@v3
+
+    - name: Generate Security Report
+      run: |
+        echo "# Security Scan Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **SpotBugs**: Java static analysis" >> $GITHUB_STEP_SUMMARY
+        echo "- **Trivy**: Vulnerability database scan" >> $GITHUB_STEP_SUMMARY
+        echo "- **OWASP Dependency-Check**: Vulnerable dependency detection" >> $GITHUB_STEP_SUMMARY
+        echo "- **NPM Audit**: Frontend dependency vulnerabilities" >> $GITHUB_STEP_SUMMARY
+        echo "- **Semgrep**: Pattern-based static analysis (SAST)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "See artifacts for detailed results." >> $GITHUB_STEP_SUMMARY
+
+    - name: Fail if security issues found
+      run: exit 0
+      # Modify this to 'exit 1' if you want to fail the workflow on findings
